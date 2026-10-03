@@ -57,6 +57,12 @@ mcp-guard scan ./my-mcp-server --deny-server "untrusted-*" --deny
 # (requires: pip install "mcp-guard[canary] @ git+https://github.com/yunaremaia/mcp-guard.git")
 mcp-guard scan ./my-mcp-server --strict-injection
 
+# Verify npm supply chain (sigstore attestations / provenance)
+mcp-guard verify @modelcontextprotocol/server-memory
+
+# Enforce a strict policy: fail if the package is unsigned (no provenance)
+mcp-guard verify @scope/mcp-server@1.2.0 --policy strict --format json
+
 # Show server info without scanning
 mcp-guard info ./my-mcp-server
 ```
@@ -84,6 +90,47 @@ Use the `--deny` flag to fail with exit code 1 whenever any denied server or too
 ```bash
 mcp-guard scan ./my-mcp-server --config policy.yaml --deny
 ```
+
+## Supply Chain Verification
+
+`mcp-guard verify` checks whether an npm-distributed MCP server was published
+with **sigstore attestations** (provenance / SLSA). It queries the npm registry
+for the attestations attached to a package version and reports whether the
+artifact you are about to run was built with provenance:
+
+```bash
+# Unscoped, scoped, pinned or floating version references all work
+mcp-guard verify some-mcp-server
+mcp-guard verify @scope/some-mcp-server@1.2.0
+
+# Machine-readable output for CI pipelines
+mcp-guard verify @scope/some-mcp-server --format json
+
+# Strict policy: exit code 1 when the version is unsigned
+mcp-guard verify @scope/some-mcp-server --policy strict
+```
+
+Statuses:
+
+| status | meaning |
+|---|---|
+| `signed` | sigstore attestations found (and whether one is a SLSA provenance statement) |
+| `unsigned` | the version exists but no attestations were published with it |
+| `not_found` | the package does not exist on the registry |
+| `registry_error` | the registry could not be reached or answered unexpectedly |
+
+Exit codes: `0` when verified signed (or in report mode); `1` when the package
+is unsigned under `--policy strict`, when it is not found, or on registry
+errors — ready to gate CI jobs.
+
+Notes:
+
+- No new runtime dependencies: the verifier uses only the standard library
+  (`urllib`), and the network layer is injectable, so the test suite stays
+  fully offline.
+- Verification currently covers npm packages. PyPI (PEP 740 attestations),
+  Docker (cosign / SBOM) and reproducible-build checks are tracked as
+  follow-ups in [#74](https://github.com/yunaremaia/mcp-guard/issues/74).
 
 ## What It Detects
 

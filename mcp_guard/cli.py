@@ -17,6 +17,7 @@ from .parser import MCPParser
 from .policy import DenyPolicy
 from .rules import ALL_RULES, PromptInjectionRule, SecurityRule
 from .scanner import Scanner
+from .supply_chain import SupplyChainResult, SupplyChainStatus, verify_npm_package
 
 
 @click.group()
@@ -222,6 +223,83 @@ def info(path: str) -> None:
         )
         if cap.description:
             console.print(f"    {escape(cap.description[:80])}")
+
+
+@main.command()
+@click.argument("package_ref")
+@click.option(
+    "--policy",
+    "-p",
+    type=click.Choice(["report", "strict"]),
+    default="report",
+    help="report: informational output (default). strict: exit with an error "
+    "when the package is unsigned (supply chain policy)",
+)
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["cli", "json"]),
+    default="cli",
+    help="Output format",
+)
+def verify(package_ref: str, policy: str, output_format: str) -> None:
+    """Verify the npm supply chain of an MCP server package.
+
+    PACKAGE_REF is an npm package reference: name, name@version,
+    @scope/name or @scope/name@version. Checks the npm registry for
+    sigstore attestations (provenance / SLSA) published with the
+    package version, and reports whether it was built with provenance.
+
+    Exit codes: 0 verified signed (or report mode); 1 unsigned under
+    --policy strict, package not found, or registry error.
+    """
+    console = Console()
+
+    try:
+        result = verify_npm_package(package_ref)
+    except ValueError as e:
+        # InvalidPackageRef subclasses ValueError; invalid refs quote the
+        # offending input verbatim, hence the escape.
+        console.print(f"[red]Error: {escape(str(e))}[/red]")
+        sys.exit(1)
+
+    if output_format == "json":
+        click.echo(json.dumps(result.model_dump(mode="json"), indent=2))
+    else:
+        _print_verify_result(console, result)
+
+    if result.status in (SupplyChainStatus.NOT_FOUND, SupplyChainStatus.REGISTRY_ERROR):
+        sys.exit(1)
+    if policy == "strict" and result.status is SupplyChainStatus.UNSIGNED:
+        sys.exit(1)
+
+
+def _print_verify_result(console: Console, result: SupplyChainResult) -> None:
+    """Render a supply chain result with Rich.
+
+    Every registry-controlled string (package name, version, predicate
+    types) is escaped before reaching Rich markup.
+    """
+    style = {
+        SupplyChainStatus.SIGNED: "green",
+        SupplyChainStatus.UNSIGNED: "yellow",
+        SupplyChainStatus.NOT_FOUND: "red",
+        SupplyChainStatus.REGISTRY_ERROR: "red",
+    }[result.status]
+
+    console.print(f"[bold]Package:[/bold] {escape(result.package)}")
+    console.print(f"[bold]Version:[/bold] {escape(result.version)}")
+    console.print(f"[bold]Status:[/bold] [{style}]{escape(result.status.value)}[/{style}]")
+    if result.status is SupplyChainStatus.SIGNED:
+        provenance = "yes" if result.has_provenance else "no"
+        console.print(f"[bold]Provenance:[/bold] {provenance}")
+        console.print(f"[bold]Attestations:[/bold] {len(result.attestations)}")
+        for att in result.attestations:
+            kind = " (provenance)" if att.is_provenance else ""
+            console.print(f"  - {escape(att.predicate_type)}{kind}")
+    if result.message:
+        console.print(f"[dim]{escape(result.message)}[/dim]")
 
 
 if __name__ == "__main__":
