@@ -3,10 +3,43 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, cast
 
 from .models import MCPCapability, MCPCapabilityType, MCPManifest
+
+# Leading verbs that mark a capability as read-only regardless of the rest of
+# its identifier: MCP tool names conventionally lead with the operation verb,
+# so `get_clear_status` ("get the clear-status") and `search_update_records`
+# ("search the update-records") are reads even though `clear`/`update` appear
+# as identifier segments (#84).
+_READ_VERBS = frozenset(
+    {
+        "check",
+        "describe",
+        "fetch",
+        "find",
+        "get",
+        "has",
+        "inspect",
+        "is",
+        "list",
+        "lookup",
+        "query",
+        "read",
+        "retrieve",
+        "search",
+        "select",
+        "show",
+        "view",
+    }
+)
+
+# camelCase boundary: lower/digit followed by upper (same split the
+# prompt-injection module applies to identifiers).
+_CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_IDENTIFIER_SEPARATORS = re.compile(r"[\s_\-.]+")
 
 
 class MCPParser:
@@ -159,10 +192,35 @@ class MCPParser:
                     return True
         return False
 
+    @staticmethod
+    def _name_tokens(name: str) -> list[str]:
+        """Tokenize an identifier (snake_case, kebab-case, camelCase) into words."""
+        spaced = _CAMEL_SPLIT.sub(" ", name)
+        return [token for token in _IDENTIFIER_SEPARATORS.split(spaced.lower()) if token]
+
+    @classmethod
+    def _keyword_hit(cls, keywords: list[str], name: str, desc: str) -> bool:
+        """Match a keyword list against an identifier and its description.
+
+        Names are tokenized so a keyword only matches a whole identifier
+        segment: `delete_repo` still matches `delete`, but `get_address` no
+        longer matches `add` inside "address" (#84). A leading read-only verb
+        suppresses name matching entirely (`search_update_records` is a read).
+
+        Descriptions are matched on word boundaries, so `created`, `settings`
+        and `input` no longer match `create`, `set` or `put` as substrings.
+        """
+        tokens = cls._name_tokens(name)
+        if (not tokens or tokens[0] not in _READ_VERBS) and any(
+            keyword in tokens for keyword in keywords
+        ):
+            return True
+        return any(re.search(rf"\b{re.escape(keyword)}\b", desc) for keyword in keywords)
+
     @classmethod
     def _detect_destructive(cls, data: dict[str, Any]) -> bool:
         """Detect if capability performs destructive operations."""
-        name = data.get("name", "").lower()
+        name = data.get("name", "")
         desc = data.get("description", "").lower()
 
         destructive_keywords = [
@@ -178,12 +236,12 @@ class MCPParser:
             "terminate",
         ]
 
-        return any(keyword in name or keyword in desc for keyword in destructive_keywords)
+        return cls._keyword_hit(destructive_keywords, name, desc)
 
     @classmethod
     def _detect_write(cls, data: dict[str, Any]) -> bool:
         """Detect if capability performs write operations."""
-        name = data.get("name", "").lower()
+        name = data.get("name", "")
         desc = data.get("description", "").lower()
 
         write_keywords = [
@@ -201,4 +259,4 @@ class MCPParser:
             "send",
         ]
 
-        return any(keyword in name or keyword in desc for keyword in write_keywords)
+        return cls._keyword_hit(write_keywords, name, desc)

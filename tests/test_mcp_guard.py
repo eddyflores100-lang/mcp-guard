@@ -151,6 +151,93 @@ class TestParser:
                 MCPParser.from_directory(tmpdir)
 
 
+class TestKeywordBoundaryMatching:
+    """Write/destructive keywords match whole words, not substrings (#84)."""
+
+    @staticmethod
+    def parse_tool(name: str, description: str) -> MCPCapability:
+        manifest = MCPParser.from_dict(
+            {"name": "srv", "tools": [{"name": name, "description": description}]}
+        )
+        return manifest.capabilities[0]
+
+    def test_read_only_names_no_longer_match_substring_keywords(self):
+        """The false positives reproduced in the issue stop matching."""
+        for name in ("get_address", "read_settings", "search_update_records"):
+            cap = self.parse_tool(name, "Return records")
+            assert cap.is_write is False, name
+
+    def test_get_clear_status_is_not_destructive(self):
+        """A leading read verb marks the capability read-only."""
+        cap = self.parse_tool("get_clear_status", "Return records")
+        assert cap.is_destructive is False
+        assert cap.is_write is False
+
+    def test_description_substring_words_do_not_match(self):
+        """'created'/'settings'/'input' no longer trip create/set/put."""
+        cap = self.parse_tool("list_records", "Return the list of created records")
+        assert cap.is_write is False
+
+        cap = self.parse_tool("read_config", "Manage the settings for this server")
+        assert cap.is_write is False
+
+        cap = self.parse_tool("query_status", "Read the input and report")
+        assert cap.is_write is False
+
+    def test_description_word_boundary_hits_still_match(self):
+        """Genuine keyword mentions in descriptions still classify."""
+        cap = self.parse_tool("apply_config", "Set the temperature")
+        assert cap.is_write is True
+
+        cap = self.parse_tool("cleanup", "Delete all records")
+        assert cap.is_destructive is True
+
+    def test_true_positive_names_still_match(self):
+        """Whole identifier segments keep matching their keywords."""
+        for name, write, destructive in (
+            ("delete_repo", False, True),
+            ("clear_cache", False, True),
+            ("create_user", True, False),
+            ("update_records", True, False),
+            ("add_user", True, False),
+            ("delete", False, True),
+        ):
+            cap = self.parse_tool(name, "Operate on data")
+            assert cap.is_write is write, name
+            assert cap.is_destructive is destructive, name
+
+    def test_camel_case_and_kebab_case_names_are_tokenized(self):
+        """camelCase and kebab-case identifiers split into the same tokens."""
+        cap = self.parse_tool("deleteFile", "Operate on data")
+        assert cap.is_destructive is True
+
+        cap = self.parse_tool("drop-table", "Operate on data")
+        assert cap.is_destructive is True
+
+    def test_read_verb_guard_does_not_suppress_description_matches(self):
+        """The guard only suppresses name matches; descriptions still count."""
+        cap = self.parse_tool("get_user", "Delete the user permanently")
+        assert cap.is_destructive is True
+
+        cap = self.parse_tool("get_user", "Get user by ID")
+        assert cap.is_destructive is False
+        assert cap.is_write is False
+
+    def test_capability_without_name_uses_description_only(self):
+        """A missing name degrades to description-only matching."""
+        manifest = MCPParser.from_dict(
+            {"name": "srv", "tools": [{"description": "Delete everything"}]}
+        )
+        assert manifest.capabilities[0].is_destructive is True
+
+    def test_name_tokens_split_identifiers(self):
+        """Tokenization covers snake, kebab, camel and single words."""
+        assert MCPParser._name_tokens("get_address") == ["get", "address"]
+        assert MCPParser._name_tokens("drop-in") == ["drop", "in"]
+        assert MCPParser._name_tokens("deleteFile") == ["delete", "file"]
+        assert MCPParser._name_tokens("delete") == ["delete"]
+
+
 class TestRules:
     """Test security rules."""
 
