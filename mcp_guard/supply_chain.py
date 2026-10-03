@@ -179,10 +179,10 @@ def _attestations_url(manifest: dict[str, Any]) -> str | None:
     dist: object = manifest.get("dist")
     if not isinstance(dist, dict):
         return None
-    attestations = cast("dict[str, Any]", dist).get("attestations")
-    if not isinstance(attestations, dict):
+    attestations_obj: object = cast("dict[str, Any]", dist).get("attestations")
+    if not isinstance(attestations_obj, dict):
         return None
-    url = attestations.get("url")
+    url = cast("dict[str, Any]", attestations_obj).get("url")
     return url if isinstance(url, str) and url else None
 
 
