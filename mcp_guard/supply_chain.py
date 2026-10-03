@@ -1,13 +1,21 @@
 """Supply chain verification for npm-distributed MCP servers.
 
 Checks the npm registry for sigstore attestations (provenance / SLSA)
-published alongside a package version. The registry contract used here:
+published alongside a package version. The registry contract used here
+(mirrors how ``npm audit signatures`` resolves attestations via pacote):
 
-- ``GET /{name}`` — package metadata (``dist-tags``); 404 means the
-  package does not exist.
-- ``GET /-/npm/v1/packages/attestations/{name}/{version}`` — the
-  package's attestations; 404 means the version exists but nothing was
-  published with provenance (unsigned).
+- ``GET /{name}`` — the package packument (``dist-tags`` + per-version
+  manifests under ``versions``); 404 means the package does not exist.
+  Used to resolve an unpinned reference to its latest version.
+- ``GET /{name}/{version}`` — the version manifest for a pinned
+  reference; 404 means that version does not exist.
+- The version manifest's ``dist.attestations`` object — when present it
+  carries the ``url`` of the version's attestations. The attestations
+  endpoint is *discovered* from the manifest rather than constructed:
+  only the URL's path is kept and re-attached to the registry base (the
+  same normalization pacote performs), so a manifest can never redirect
+  the fetch to a third-party host. When ``dist.attestations`` is absent
+  the version is unsigned and no second request is made.
 
 All network access goes through an injectable ``JsonFetcher`` so the
 module stays fully offline-testable (no network calls in the test suite,
@@ -22,13 +30,12 @@ from collections.abc import Callable
 from enum import Enum
 from typing import Any, NamedTuple, cast
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, Field
 
 NPM_REGISTRY = "https://registry.npmjs.org"
-NPM_ATTENDATIONS_PATH = "/-/npm/v1/packages/attestations"
 
 #: Predicate types that carry a build provenance statement (SLSA).
 PROVENANCE_PREDICATE_PREFIX = "https://slsa.dev/provenance"
@@ -150,14 +157,46 @@ def _validate_name(name: str) -> None:
 
 
 def metadata_url(package_name: str) -> str:
-    """Registry URL for a package's metadata document."""
+    """Registry URL for a package's packument (metadata document)."""
     return f"{NPM_REGISTRY}/{quote(package_name, safe='@/')}"
 
 
-def attestations_url(package_name: str, version: str) -> str:
-    """Registry URL for a package version's attestations."""
+def manifest_url(package_name: str, version: str) -> str:
+    """Registry URL for a specific version's manifest."""
     quoted = quote(package_name, safe="@/")
-    return f"{NPM_REGISTRY}{NPM_ATTENDATIONS_PATH}/{quoted}/{quote(version, safe='')}"
+    return f"{NPM_REGISTRY}/{quoted}/{quote(version, safe='')}"
+
+
+def _attestations_url(manifest: dict[str, Any]) -> str | None:
+    """Read the attestations URL a version manifest advertises.
+
+    The registry — not the client — decides where a version's
+    attestations live (``dist.attestations.url``, the field
+    ``npm audit signatures`` follows). A missing or malformed
+    ``dist.attestations`` means nothing was published with provenance,
+    so the caller treats the version as unsigned.
+    """
+    dist: object = manifest.get("dist")
+    if not isinstance(dist, dict):
+        return None
+    attestations = cast("dict[str, Any]", dist).get("attestations")
+    if not isinstance(attestations, dict):
+        return None
+    url = attestations.get("url")
+    return url if isinstance(url, str) and url else None
+
+
+def _attestations_fetch_url(url: str) -> str:
+    """Normalize a manifest-advertised URL onto the registry base.
+
+    Only the URL's path is kept and re-attached to ``NPM_REGISTRY`` —
+    the same normalization ``pacote`` applies — so registry-controlled
+    URLs can never direct the second request at a different host.
+    """
+    path = urlparse(url).path
+    if not path:
+        raise RegistryError(f"Manifest attestations URL has no path: {url!r}")
+    return f"{NPM_REGISTRY}{path}"
 
 
 def default_fetch_json(url: str) -> dict[str, Any]:
@@ -187,7 +226,7 @@ def default_fetch_json(url: str) -> dict[str, Any]:
 
 
 def _extract_latest_version(metadata: dict[str, Any]) -> str:
-    """Read ``dist-tags.latest`` from a package metadata document."""
+    """Read ``dist-tags.latest`` from a package packument."""
     dist_tags: object = metadata.get("dist-tags", {})
     if not isinstance(dist_tags, dict):
         raise RegistryError("Metadata payload has no dist-tags object")
@@ -195,6 +234,17 @@ def _extract_latest_version(metadata: dict[str, Any]) -> str:
     if not isinstance(latest, str) or not latest:
         raise RegistryError("Metadata payload has no latest dist-tag")
     return latest
+
+
+def _version_manifest(packument: dict[str, Any], version: str) -> dict[str, Any]:
+    """Read one version's manifest out of a packument."""
+    versions: object = packument.get("versions")
+    if not isinstance(versions, dict):
+        raise RegistryError("Packument payload has no versions object")
+    manifest: object = cast("dict[str, Any]", versions).get(version)
+    if not isinstance(manifest, dict):
+        raise RegistryError(f"Packument has no manifest for version {version}")
+    return cast("dict[str, Any]", manifest)
 
 
 def _parse_attestations(payload: dict[str, Any]) -> list[AttestationInfo]:
@@ -219,9 +269,7 @@ def _parse_attestations(payload: dict[str, Any]) -> list[AttestationInfo]:
         predicate: object = entry.get("predicateType", "")
         bundle: object = entry.get("bundle", "")
         media_type: object = (
-            cast("dict[str, Any]", bundle).get("mediaType", "")
-            if isinstance(bundle, dict)
-            else ""
+            cast("dict[str, Any]", bundle).get("mediaType", "") if isinstance(bundle, dict) else ""
         )
         predicate_str = predicate if isinstance(predicate, str) else ""
         media_str = media_type if isinstance(media_type, str) else ""
@@ -241,34 +289,26 @@ def verify_npm_package(
 ) -> SupplyChainResult:
     """Verify the supply chain of an npm package version.
 
-    Resolves the version (from the reference or ``dist-tags.latest``),
-    then checks the npm registry for sigstore attestations published with
-    that version. Never raises for registry-side outcomes; only
+    Resolves the version (pinned references fetch the version manifest
+    directly; unpinned references read ``dist-tags`` and the per-version
+    manifest out of the packument), discovers the attestations URL from
+    the manifest's ``dist.attestations`` object, and fetches it when
+    present. Never raises for registry-side outcomes; only
     :class:`InvalidPackageRefError` propagates for malformed input.
     """
     ref = parse_npm_ref(package_ref)
 
-    try:
-        metadata = fetch_json(metadata_url(ref.name))
-    except RegistryNotFoundError:
-        return SupplyChainResult(
-            package=ref.name,
-            version=ref.version or "unknown",
-            status=SupplyChainStatus.NOT_FOUND,
-            message=f"Package {ref.name} does not exist on the registry",
-        )
-    except RegistryError as e:
-        return SupplyChainResult(
-            package=ref.name,
-            version=ref.version or "unknown",
-            status=SupplyChainStatus.REGISTRY_ERROR,
-            message=str(e),
-        )
-
     version = ref.version
     if version is None:
         try:
-            version = _extract_latest_version(metadata)
+            packument = fetch_json(metadata_url(ref.name))
+        except RegistryNotFoundError:
+            return SupplyChainResult(
+                package=ref.name,
+                version="unknown",
+                status=SupplyChainStatus.NOT_FOUND,
+                message=f"Package {ref.name} does not exist on the registry",
+            )
         except RegistryError as e:
             return SupplyChainResult(
                 package=ref.name,
@@ -277,16 +317,65 @@ def verify_npm_package(
                 message=str(e),
             )
 
-    try:
-        payload = fetch_json(attestations_url(ref.name, version))
-    except RegistryNotFoundError:
+        try:
+            version = _extract_latest_version(packument)
+            manifest = _version_manifest(packument, version)
+        except RegistryError as e:
+            return SupplyChainResult(
+                package=ref.name,
+                version=version or "unknown",
+                status=SupplyChainStatus.REGISTRY_ERROR,
+                message=str(e),
+            )
+    else:
+        try:
+            manifest = fetch_json(manifest_url(ref.name, version))
+        except RegistryNotFoundError:
+            return SupplyChainResult(
+                package=ref.name,
+                version=version,
+                status=SupplyChainStatus.NOT_FOUND,
+                message=f"Version {ref.name}@{version} does not exist on the registry",
+            )
+        except RegistryError as e:
+            return SupplyChainResult(
+                package=ref.name,
+                version=version,
+                status=SupplyChainStatus.REGISTRY_ERROR,
+                message=str(e),
+            )
+
+    discovered = _attestations_url(manifest)
+    if discovered is None:
         return SupplyChainResult(
             package=ref.name,
             version=version,
             status=SupplyChainStatus.UNSIGNED,
             message=(
-                "No sigstore attestations published for "
-                f"{ref.name}@{version} (no provenance)"
+                f"No sigstore attestations published for {ref.name}@{version} (no provenance)"
+            ),
+        )
+
+    try:
+        fetch_url = _attestations_fetch_url(discovered)
+    except RegistryError as e:
+        return SupplyChainResult(
+            package=ref.name,
+            version=version,
+            status=SupplyChainStatus.REGISTRY_ERROR,
+            message=str(e),
+        )
+
+    try:
+        payload = fetch_json(fetch_url)
+    except RegistryNotFoundError:
+        return SupplyChainResult(
+            package=ref.name,
+            version=version,
+            status=SupplyChainStatus.REGISTRY_ERROR,
+            message=(
+                f"Manifest advertises attestations at {discovered} "
+                "but the registry returned 404 for it"
             ),
         )
     except RegistryError as e:
