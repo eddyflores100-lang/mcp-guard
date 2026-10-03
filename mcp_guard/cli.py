@@ -179,9 +179,12 @@ def scan(
     if fail_on:
         levels = {"low": 0, "medium": 1, "high": 2, "critical": 3}
         threshold = levels[fail_on]
+        # An empty scan reads as "below every threshold", including "low":
+        # with `default=0` the comparison `0 >= 0` tripped `--fail-on low`
+        # even on a zero-findings scan (#82).
         max_level = max(
             (levels.get(f.level.value.lower(), 0) for f in result.findings),
-            default=0,
+            default=-1,
         )
         if max_level >= threshold:
             sys.exit(1)

@@ -276,6 +276,28 @@ class TestScanFailOn:
 
         assert result.exit_code == 0
 
+    def test_low_threshold_passes_on_clean_manifest(self, tmp_path: Path):
+        """A zero-findings scan stays green under --fail-on low (#82)."""
+        manifest = write_manifest(tmp_path / "srv", CLEAN_MANIFEST)
+
+        result = CliRunner().invoke(main, ["scan", str(manifest), "--fail-on", "low"])
+
+        assert result.exit_code == 0
+
+    def test_low_threshold_triggers_on_low_finding(self, tmp_path: Path):
+        """--fail-on low still trips when a LOW finding exists (#82)."""
+        manifest = write_manifest(
+            tmp_path / "srv",
+            {
+                "name": "low-server",
+                "tools": [{"name": "ping", "description": "hi"}],
+            },
+        )
+
+        result = CliRunner().invoke(main, ["scan", str(manifest), "--fail-on", "low"])
+
+        assert result.exit_code == 1
+
 
 class TestInfoCommand:
     """The info subcommand reports manifest metadata without scanning."""
