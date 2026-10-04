@@ -371,6 +371,44 @@ class PromptInjectionRule(SecurityRule):
         )
 
 
+class UnauthenticatedCommandExecutionRule(SecurityRule):
+    """Detect command execution without authentication (#89).
+
+    Deliberately decoupled from the write/destructive machinery: a shell tool
+    neither mutates data nor destroys it, so it must not raise MCP005-style
+    "no corresponding read" advice or MCP001 "performs write operations"
+    text. The message states what the tool actually does.
+    """
+
+    rule_id = "MCP009"
+    description = "Command execution without authentication"
+
+    def check(
+        self,
+        capability: MCPCapability,
+        manifest: MCPManifest,
+    ) -> list[RiskFinding]:
+        findings: list[RiskFinding] = []
+        if capability.is_command_execution and not capability.has_auth:
+            findings.append(
+                RiskFinding(
+                    rule_id=self.rule_id,
+                    level=RiskLevel.HIGH,
+                    message=(
+                        f"Capability '{capability.name}' executes arbitrary commands "
+                        "without authentication"
+                    ),
+                    capability_name=capability.name,
+                    capability_type=capability.type,
+                    suggestion=(
+                        "Add authentication (OAuth2, API key) and constrain the command "
+                        "surface this capability accepts (allowlist, sandboxing)"
+                    ),
+                )
+            )
+        return findings
+
+
 # Registry of all rules
 ALL_RULES: list[SecurityRule] = [
     UnauthenticatedWriteRule(),
@@ -381,4 +419,5 @@ ALL_RULES: list[SecurityRule] = [
     DestructiveWithoutConfirmationRule(),
     ExplicitlyDisabledAuthRule(),
     PromptInjectionRule(),
+    UnauthenticatedCommandExecutionRule(),
 ]

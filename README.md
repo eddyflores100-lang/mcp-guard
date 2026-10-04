@@ -144,6 +144,7 @@ Notes:
 | MCP006 | HIGH | Destructive operation without confirmation |
 | MCP007 | MEDIUM / HIGH / CRITICAL | Explicitly disabled authentication ('auth': false) |
 | MCP008 | LOW / MEDIUM / HIGH | Possible prompt injection in server or capability metadata |
+| MCP009 | HIGH | Command execution without authentication |
 | DENY001 | CRITICAL | Server matches security policy deny rule |
 | DENY002 | CRITICAL | Tool capability matches security policy deny rule |
 
@@ -203,6 +204,27 @@ In JSON and SARIF output each MCP008 finding has `injection_type` (e.g. `instruc
 `prompt-extraction`, `exfiltration`, `hidden-characters`, `encoded-payload`),
 `metadata_field` (e.g. `inputSchema.properties.path.description`), `detector`
 (`mcp-guard` or `little-canary`), `evidence` and `quoted` properties.
+
+### Command Execution Detection (MCP009)
+
+"Runs arbitrary code" is a different trust boundary from "mutates data" (`is_write`) and
+"loses data" (`is_destructive`), so command execution gets its own classification: a shell
+tool neither writes nor destroys, and MCP001's "performs write operations" text would be
+false in its output. `MCP009` fires at HIGH when a capability with no authentication matches
+the execution family — `exec`, `execute`, `eval`, `spawn`, `shell`, `bash`, `cmd`, `command`,
+`subprocess`, `popen`, `terminal` — as whole identifier segments or inflected description
+words, exactly like MCP001/MCP002. Read-verb suppression applies, so `get_exec_summary` and
+`get_command_history` stay unflagged, while `get_and_exec` would still match (`and` marks a
+second operation). `run` and `evaluate` are deliberately excluded: measured against this
+repo's own 121-tool corpus, they add read-shaped false positives (`run_query`,
+`evaluate_model`) without catching any execution name the shell/process nouns miss.
+
+Known residuals, accepted on purpose: `execute_workflow` and `execute_sql` flag (executing a
+caller-supplied workflow or SQL string is running arbitrary logic), and a description like
+"List the available commands" on a neutral name can trip the phrase match — the same
+description-phrase artifact MCP001/MCP002 have. The rule is not coupled into MCP005 (a shell
+has no meaningful "corresponding read") or MCP006 (a confirmation field does not make an
+unauthenticated shell safe; authentication does).
 
 ## Example Output
 

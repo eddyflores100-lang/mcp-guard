@@ -37,6 +37,10 @@ class MCPCapability(BaseModel):
     auth_disabled: bool = False
     is_destructive: bool = False
     is_write: bool = False
+    # Third trust boundary (#89): "runs arbitrary code" is neither data
+    # mutation (is_write) nor data loss (is_destructive) — a shell tool
+    # crosses a different line, so it gets its own flag.
+    is_command_execution: bool = False
 
     @property
     def auth_status(self) -> str:

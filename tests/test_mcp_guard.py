@@ -23,6 +23,7 @@ from mcp_guard.rules import (
     ExcessivePermissionsRule,
     NoDescriptionRule,
     SecurityRule,
+    UnauthenticatedCommandExecutionRule,
     UnauthenticatedDestructiveRule,
     UnauthenticatedWriteRule,
     WriteWithoutReadRule,
@@ -341,6 +342,156 @@ class TestKeywordBoundaryMatching:
 
         cap = self.parse_tool("query_status", "Read the input and report")
         assert cap.is_write is False
+
+
+class TestCommandExecutionDetection:
+    """Command-execution keywords classify as their own dimension (#89)."""
+
+    @staticmethod
+    def parse_tool(name: str, description: str) -> MCPCapability:
+        manifest = MCPParser.from_dict(
+            {"name": "srv", "tools": [{"name": name, "description": description}]}
+        )
+        return manifest.capabilities[0]
+
+    def test_issue_repro_exact_snippet(self):
+        """The exact snippet from the issue, now with a third flag."""
+        m = MCPParser.from_dict(
+            {
+                "name": "srv",
+                "tools": [{"name": "exec_command", "description": "Run arbitrary shell commands"}],
+            }
+        )
+        cap = m.capabilities[0]
+        assert cap.is_write is False
+        assert cap.is_destructive is False
+        assert cap.is_command_execution is True
+
+    def test_execution_family_names_flag(self):
+        """Real command-execution names from the corpus all classify."""
+        for name in (
+            "exec_command",
+            "ssh_exec",
+            "adb_shell",
+            "run_shell_command",
+            "spawn_process",
+            "subprocess_run",
+            "open_terminal",
+            "bash",
+            "execute",
+            "eval_code",
+            "cmd_run",
+            "popen_task",
+            "terminal_exec",
+        ):
+            cap = self.parse_tool(name, "Operate on data")
+            assert cap.is_command_execution is True, name
+
+    def test_read_shaped_names_do_not_flag(self):
+        """The read-shaped false positives stay unflagged."""
+        for name in ("run_query", "get_exec_summary", "evaluate_model", "get_command_history"):
+            cap = self.parse_tool(name, "Operate on data")
+            assert cap.is_command_execution is False, name
+
+    def test_camel_case_execution_name_flags(self):
+        """camelCase identifiers tokenize to the same segments."""
+        cap = self.parse_tool("openShell", "Operate on data")
+        assert cap.is_command_execution is True
+
+    def test_conjunction_reenables_matching(self):
+        """A read verb plus conjunction plus keyword is a second operation."""
+        cap = self.parse_tool("get_and_exec_command", "Operate on data")
+        assert cap.is_command_execution is True
+
+    def test_description_execution_phrases_flag(self):
+        """Descriptions naming execution still classify on neutral names."""
+        cap = self.parse_tool("operate", "Run arbitrary shell commands")
+        assert cap.is_command_execution is True
+
+        cap = self.parse_tool("operate", "Executes arbitrary commands on the host")
+        assert cap.is_command_execution is True
+
+        cap = self.parse_tool("operate", "Spawns a subprocess for each job")
+        assert cap.is_command_execution is True
+
+    def test_description_non_execution_words_do_not_flag(self):
+        """Evaluate/run phrasing without an execution keyword stays unflagged."""
+        cap = self.parse_tool("analyze", "Evaluate the model output and report metrics")
+        assert cap.is_command_execution is False
+
+        cap = self.parse_tool("analyze", "Run the query and summarize the results")
+        assert cap.is_command_execution is False
+
+    def test_execution_dimension_is_independent_of_write(self):
+        """A shell tool is not classified as write or destructive."""
+        cap = self.parse_tool("ssh_exec", "Run a command on a remote host over SSH")
+        assert cap.is_command_execution is True
+        assert cap.is_write is False
+        assert cap.is_destructive is False
+
+
+class TestCommandExecutionRule:
+    """MCP009: unauthenticated command execution, decoupled from MCP001/MCP005."""
+
+    @staticmethod
+    def make_cap(**kwargs: object) -> MCPCapability:
+        defaults: dict[str, object] = {
+            "name": "exec_command",
+            "type": MCPCapabilityType.TOOL,
+            "description": "Run arbitrary shell commands",
+            "is_command_execution": True,
+        }
+        defaults.update(kwargs)
+        return MCPCapability(**defaults)  # type: ignore[arg-type]
+
+    def test_unauthenticated_command_execution_is_high(self):
+        rule = UnauthenticatedCommandExecutionRule()
+        cap = self.make_cap(has_auth=False)
+        manifest = MCPManifest(name="srv", capabilities=[cap])
+        findings = rule.check(cap, manifest)
+        assert len(findings) == 1
+        assert findings[0].rule_id == "MCP009"
+        assert findings[0].level == RiskLevel.HIGH
+        assert "executes arbitrary commands" in findings[0].message
+        assert "write" not in findings[0].message.lower()
+
+    def test_authenticated_command_execution_no_finding(self):
+        rule = UnauthenticatedCommandExecutionRule()
+        cap = self.make_cap(has_auth=True)
+        manifest = MCPManifest(name="srv", capabilities=[cap])
+        findings = rule.check(cap, manifest)
+        assert findings == []
+
+    def test_non_execution_capability_no_finding(self):
+        rule = UnauthenticatedCommandExecutionRule()
+        cap = self.make_cap(is_command_execution=False, name="get_status")
+        manifest = MCPManifest(name="srv", capabilities=[cap])
+        findings = rule.check(cap, manifest)
+        assert findings == []
+
+    def test_shell_tool_gets_no_mcp001_or_mcp005(self):
+        """The point of the separate dimension: no false write semantics."""
+        cap = self.make_cap(is_write=False)
+        manifest = MCPManifest(name="srv", capabilities=[cap])
+        write_findings = UnauthenticatedWriteRule().check(cap, manifest)
+        read_findings = WriteWithoutReadRule().check(cap, manifest)
+        assert write_findings == []
+        assert read_findings == []
+
+    def test_exec_server_scores_high_end_to_end(self):
+        """The #89 consequence: LOW risk on unauthenticated shells becomes HIGH."""
+        tools = [
+            {"name": n, "description": "Run arbitrary shell commands"}
+            for n in ("exec_command", "run_command", "ssh_exec", "bash_exec")
+        ]
+        manifest = MCPParser.from_dict({"name": "exec_server", "tools": tools})
+        result = Scanner().scan(manifest)
+        assert result.risk_score == RiskLevel.HIGH
+        assert any(f.rule_id == "MCP009" for f in result.findings)
+        assert len([f for f in result.findings if f.rule_id == "MCP009"]) == 4
+
+    def test_mcp009_registered_in_all_rules(self):
+        assert any(r.rule_id == "MCP009" for r in ALL_RULES)
 
 
 class TestRules:

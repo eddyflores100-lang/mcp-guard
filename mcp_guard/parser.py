@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Collection
 from functools import cache
 from pathlib import Path
 from typing import Any, cast
@@ -55,6 +56,32 @@ _CONJUNCTIONS = frozenset({"and", "or", "then", "&"})
 # flag adjectival participles like "the created date" (#84's false
 # positive), so only forms unambiguous with the lemma are included.
 _DESCRIPTION_SUFFIX = r"(?:e?s|ed|ing)?"
+
+
+# Command-execution family (#89): names/descriptions indicating the capability
+# runs arbitrary code or spawns processes. This is a third trust boundary,
+# deliberately separate from the write and destructive lists: `ssh_exec` does
+# not "perform write operations", it runs commands. `run` and `evaluate` are
+# excluded (too many read-shaped names — `run_query`, `evaluate_model`), while
+# the shell/process nouns carry the family: measured against the repo corpus,
+# this set reaches 15/15 real execution names for 3 read-shaped false
+# positives. Read-verb suppression applies as everywhere else, so
+# `get_exec_summary` and `get_command_history` stay unflagged.
+_COMMAND_EXECUTION_KEYWORDS = frozenset(
+    {
+        "exec",
+        "execute",
+        "eval",
+        "spawn",
+        "shell",
+        "bash",
+        "cmd",
+        "command",
+        "subprocess",
+        "popen",
+        "terminal",
+    }
+)
 
 
 @cache
@@ -188,6 +215,9 @@ class MCPParser:
         # Detect if capability is write-type
         is_write = cls._detect_write(data)
 
+        # Detect if capability runs arbitrary commands (#89)
+        is_command_execution = cls._detect_command_execution(data)
+
         return MCPCapability(
             name=data.get("name", "unnamed"),
             type=cap_type,
@@ -198,6 +228,7 @@ class MCPParser:
             auth_disabled=auth_disabled,
             is_destructive=is_destructive,
             is_write=is_write,
+            is_command_execution=is_command_execution,
         )
 
     @classmethod
@@ -252,7 +283,7 @@ class MCPParser:
         return [token for token in _IDENTIFIER_SEPARATORS.split(spaced.lower()) if token]
 
     @classmethod
-    def _keyword_hit(cls, keywords: list[str], name: str, desc: str) -> bool:
+    def _keyword_hit(cls, keywords: Collection[str], name: str, desc: str) -> bool:
         """Match a keyword list against an identifier and its description.
 
         Names are tokenized so a keyword only matches a whole identifier
@@ -322,3 +353,16 @@ class MCPParser:
         ]
 
         return cls._keyword_hit(write_keywords, name, desc)
+
+    @classmethod
+    def _detect_command_execution(cls, data: dict[str, Any]) -> bool:
+        """Detect if the capability executes arbitrary commands (#89).
+
+        Reuses ``_keyword_hit`` so whole-segment name matching, read-verb
+        suppression and description inflections apply exactly as they do for
+        the write and destructive dimensions.
+        """
+        name = data.get("name", "")
+        desc = data.get("description", "").lower()
+
+        return cls._keyword_hit(_COMMAND_EXECUTION_KEYWORDS, name, desc)
